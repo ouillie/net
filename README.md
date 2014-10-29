@@ -3,10 +3,12 @@ net
 This is a Python extension module written in C and Cython for implementing artificial neural networks and performing supervised machine learning.
 
 ###Install
-This package comes with a standard distutils setup script. To install:
-    python setup.py install
-in the root directory.
-####Dependencies
+This package comes with a standard distutils setup script. The basic install command is:
+```
+python setup.py install
+```
+from the root directory.
+#####Dependencies
 net depends on the following packages:
 * python >= 2.7
 * cython >= 0.17
