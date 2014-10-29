@@ -273,11 +273,3 @@ double _bin(double t) {
     return t > 0.0 ? 1.0 : 0.0;
 }
 
-int _compare_objects(const void *a, const void *b) {
-    if ((unsigned long long)a < (unsigned long long)b)
-        return -1;
-    if ((unsigned long long)a > (unsigned long long)b)
-        return 1;
-    return 0;
-}
-

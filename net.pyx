@@ -1,7 +1,8 @@
 
-from cython.parallel cimport prange
 from libc.stdlib cimport malloc, realloc, free
 from libc.math cimport log, sqrt
+from cython cimport boundscheck
+from cython.parallel cimport prange
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XDECREF
 cimport numpy as np
 
@@ -15,39 +16,46 @@ cdef extern from 'cfns.h':
     ctypedef double (*nodefn)(double) nogil
     extern double _sig(double) nogil
     extern double _bin(double) nogil
-    extern int _compare_objects(const void*, const void*) nogil
 
 # Builtin action potential functions
 def sig(double t):
+    """Returns the value of the logistic curve evaluated at t."""
     return _sig(t)
 def bin(double t):
+    """Returns 1 if t > 0, else 0."""
     return _bin(t)
 
 # Builtin cost functions
+@boundscheck(False)
 def quad_cost(np.ndarray[double] a, np.ndarray[double] e):
+    """Returns the quadratic cost between two vectors."""
+    if a.size != e.size:
+        raise ValueError('Vectors must have the same dimension.')
     cdef double r = 0.0, d
-    cdef uint64_t n1 = <uint64_t>a.size, n2 = <uint64_t>e.size, i
-    if n2 < n1:
-        n1 = n2
-    for i in range(n1):
+    cdef uint64_t s = <uint64_t>a.size, i
+    for i in range(s):
         d = a[i] - e[i]
         r += d * d
     return r / 2.0
+@boundscheck(False)
 def cent_cost(np.ndarray[double] a, np.ndarray[double] e):
+    """Returns the cross-entropy cost between two vectors."""
+    if a.size != e.size:
+        raise ValueError('Vectors must have the same dimension.')
     cdef double r = 0.0
-    cdef uint64_t n1 = <uint64_t>a.size, n2 = <uint64_t>e.size, i
-    if n2 < n1:
-        n1 = n2
-    for i in range(n1):
+    cdef uint64_t s = <uint64_t>a.size, i
+    for i in range(s):
         r -= e[i] * log(a[i]) + (1.0 - e[i]) * log(1.0 - a[i])
     return r
 
+# For looking up built-in action potential functions by name
 cdef nodefn cfns(str name):
     if name == 'sig':
         return &_sig
     if name == 'bin':
         return &_bin
     return NULL
+# For looking up built-in action potential function names by function pointer
 cdef str re_cfns(nodefn fn):
     if fn == &_sig:
         return 'sig'
@@ -56,6 +64,7 @@ cdef str re_cfns(nodefn fn):
     return None
 
 cdef class Node:
+    """The basic element of a Network."""
 
     cdef double pot[2]
     cdef object pfn
@@ -93,14 +102,23 @@ cdef class Node:
     def __call__(self, bint clock=0):
         return self.pot[clock]
 
+    cdef void _update_set(self, bint clock, double pot) nogil:
+        if self.pfn is not None:
+            with gil:
+                pot = <double>self.pfn(pot)
+        elif self.cfn != NULL:
+            pot = self.cfn(pot)
+        self.pot[not clock] = pot
+
     cdef void _update(self, bint clock) nogil:
-        pass
+        self._update_set(clock, self.pot[clock])
 
     cdef uint64_t depth(self, Path *path, int *err) nogil:
         return 0
 
     def __str__(self):
         return 'Node'
+
     def __repr__(self):
         return str(self)
 
@@ -118,23 +136,17 @@ cdef class Input(Node):
         self.data = data if self.size > 0 else None
         self.fn = fn
 
+    @boundscheck(False)
     cdef void _update(self, bint clock) nogil:
-        cdef double pot
         if self.data is not None:
-            pot = self.data[self.i]
+            self._update_set(clock, self.data[self.i])
             self.i += 1
             if self.loop:
                 self.i %= self.size
             elif self.i >= self.size:
                 self.data = None
         else:
-            pot = 0.0
-        if self.pfn is not None:
-            with gil:
-                pot = <double>self.pfn(pot)
-        elif self.cfn != NULL:
-            pot = self.cfn(pot)
-        self.pot[not clock] = pot
+            self._update_set(clock, 0.0)
 
     def __str__(self):
         return 'Input'
@@ -142,7 +154,7 @@ cdef class Input(Node):
     @classmethod
     def Layer(self, double[:,:] data=None, object fn=None, double value=0.0, bint loop=0):
         cols = data.shape[1]
-        return [Input(data=data[i], fn=fn, value=value, loop=loop) for i in range(cols)]
+        return [self(data=data[:,i], fn=fn, value=value, loop=loop) for i in range(cols)]
 
 cdef struct Parent:
     PyObject *node
@@ -253,12 +265,7 @@ cdef class Neuron(Node):
         cdef uint64_t i
         for i in range(self.c):
             pot += (<Node>self.parents[i].node).pot[clock] * self.parents[i].bias
-        if self.pfn is not None:
-            with gil:
-                pot = <double>self.pfn(pot)
-        elif self.cfn != NULL:
-            pot = self.cfn(pot)
-        self.pot[not clock] = pot
+        self._update_set(clock, pot)
 
     cdef uint64_t depth(self, Path *path, int *err) nogil:
         cdef uint64_t i, tmp, r = 0
@@ -287,7 +294,6 @@ cdef class Neuron(Node):
         self.dCdp = <double*>malloc((self.c + 1) * sizeof(double))
         if self.dCdp == NULL:
             raise MemoryError('Not enough memory to allocate self.dCdp.')
-            return -1
         cdef uint64_t i, j = self.c + 1
         for i in range(j):
             self.dCdp[i] = 0.0
@@ -327,7 +333,6 @@ cdef PyObject **l_to_a(list l, uint64_t *c_out, PyObject **prev, uint64_t prevc)
     prev = <PyObject**>realloc(prev, c_out[0] * sizeof(PyObject*))
     if prev == NULL:
         raise MemoryError('Not enough memory to reallocate array of Python objects.')
-        return NULL
     cdef uint64_t j = 0
     for e in l:
         if not isinstance(e, Node):
@@ -335,7 +340,6 @@ cdef PyObject **l_to_a(list l, uint64_t *c_out, PyObject **prev, uint64_t prevc)
                 Py_XDECREF(prev[i])
             free(prev)
             raise TypeError('All nodes of a network must be Nodes.')
-            return NULL
         prev[j] = <PyObject*>e
         Py_INCREF(e)
         j += 1
