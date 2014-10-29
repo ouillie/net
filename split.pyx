@@ -3,6 +3,8 @@
 from libc.stdlib cimport malloc, free
 cimport numpy as np
 
+DEF UINT_SIZE = 32
+
 cdef shqueue *new_shqueue(np.ndarray[double] seq) except NULL:
     cdef uint64_t size = seq.size
     if size == 0:
@@ -17,7 +19,7 @@ cdef shqueue *new_shqueue(np.ndarray[double] seq) except NULL:
         free(r)
         raise MemoryError('Not enough memory to allocate shqueue.vector.')
         return NULL
-    cdef size_t bm_len = (size - 1) / sizeof(unsigned int) + 1
+    cdef size_t bm_len = (size - 1) / UINT_SIZE + 1
     r.spent = <unsigned int*>malloc(bm_len * sizeof(unsigned int))
     if r.spent == NULL:
         free(r.vector)
@@ -37,45 +39,9 @@ cdef void free_shqueue(shqueue *shq) nogil:
     free(shq.spent)
     free(shq)
 
-cdef class Splitter:
-
-    def __cinit__(self, SplitterHouse house, uint64_t i):
-        self.house = house
-        self.i = i
-
-    cdef double nxt(self, int *err) nogil:
-        cdef double r = 0.0
-        cdef shqueue *shq
-        if self.house is None:
-            if err != NULL:
-                err[0] = -1
-        else:
-            shq = self.house.first
-            while shq != NULL and shq.spent[self.i/sizeof(unsigned int)] & (1 << self.i % sizeof(unsigned int)) != 0:
-                shq = shq.nxt
-            if shq == NULL:
-                with gil:
-                    if self.house.get_next() == -1:
-                        self.house = None
-                        if err != NULL:
-                            err[0] = -1
-                        return r
-                shq = self.house.last
-            shq.spent[self.i/sizeof(unsigned int)] |= (1 << self.i % sizeof(unsigned int))
-            r = shq.vector[self.i]
-            self.house.purge()
-        return r
-
-    def __next__(self):
-        cdef int err = 0
-        cdef double r = self.nxt(&err)
-        if err == -1:
-            raise StopIteration
-        return r
-
 cdef class SplitterHouse:
 
-    def __cinit__(self, object source):
+    def __init__(self, object source):
         cdef np.ndarray[double] head
         try:
             head = next(source)
@@ -95,16 +61,14 @@ cdef class SplitterHouse:
             free_shqueue(shq)
             shq = nxt
 
-    cdef int get_next(self) except -1:
+    cdef int get_next(self):
         if self.source is None:
-            raise StopIteration
             return -1
         cdef np.ndarray[double] n
         try:
             n = next(self.source)
         except:
             self.source = None
-            raise
             return -1
         cdef shqueue *shq = new_shqueue(n)
         if self.first == NULL:
@@ -118,23 +82,63 @@ cdef class SplitterHouse:
         cdef shqueue *shq = self.first
         cdef shqueue *nxt = NULL
         cdef shqueue *prev = NULL
-        cdef uint64_t i
+        cdef uint64_t i, bm_len_minus_one = (self.width - 1) / UINT_SIZE
+        cdef unsigned int all_ones
         cdef bint should_free
         while shq != NULL:
             should_free = 1
-            for i in range(self.width):
-                if shq.spent[i/sizeof(unsigned int)] & (1 << i % sizeof(unsigned int)) == 0:
+            all_ones = (~0)
+            for i in range(bm_len_minus_one):
+                if shq.spent[i] & all_ones != all_ones:
                     should_free = 0
                     break
             if should_free:
-                nxt = shq.nxt
-                free_shqueue(shq)
-                if shq.nxt == NULL:
-                    self.last = prev
-                if prev == NULL:
-                    self.first = shq.nxt
-                else:
-                    prev.nxt = shq.nxt
+                all_ones >>= UINT_SIZE - ((self.width - 1) % UINT_SIZE + 1)
+                if shq.spent[bm_len_minus_one] & all_ones == all_ones:
+                    nxt = shq.nxt
+                    free_shqueue(shq)
+                    if shq.nxt == NULL:
+                        self.last = prev
+                    if prev == NULL:
+                        self.first = shq.nxt
+                    else:
+                        prev.nxt = shq.nxt
             prev = shq
             shq = shq.nxt
+
+cdef class Splitter:
+
+    def __cinit__(self, SplitterHouse house, uint64_t i):
+        self.house = house
+        self.i = i
+
+    cdef double nxt(self, int *err) nogil:
+        cdef double r = 0.0
+        cdef shqueue *shq
+        if self.house is None:
+            if err != NULL:
+                err[0] = -1
+        else:
+            shq = self.house.first
+            while shq != NULL and shq.spent[self.i/UINT_SIZE] & (1 << self.i % UINT_SIZE) != 0:
+                shq = shq.nxt
+            if shq == NULL:
+                with gil:
+                    if self.house.get_next() == -1:
+                        self.house = None
+                        if err != NULL:
+                            err[0] = -1
+                        return r
+                shq = self.house.last
+            shq.spent[self.i/UINT_SIZE] |= (1 << self.i % UINT_SIZE)
+            r = shq.vector[self.i]
+            self.house.purge()
+        return r
+
+    def __next__(self):
+        cdef int err = 0
+        cdef double r = self.nxt(&err)
+        if err == -1:
+            raise StopIteration
+        return r
 

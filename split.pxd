@@ -17,6 +17,6 @@ cdef class SplitterHouse:
     cdef shqueue *first
     cdef shqueue *last
     cdef uint64_t width, ref
-    cdef int get_next(self) except -1
+    cdef int get_next(self)
     cdef void purge(self) nogil
 

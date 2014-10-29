@@ -3,7 +3,6 @@ from cython.parallel cimport prange
 from libc.stdlib cimport malloc, realloc, free
 from libc.math cimport log, sqrt
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XDECREF
-from split cimport Splitter, SplitterHouse as SH
 cimport numpy as np
 
 from numpy.random import normal
@@ -94,10 +93,8 @@ cdef class Node:
     def __call__(self, bint clock=0):
         return self.pot[clock]
 
-    cdef int _update(self, bint clock) nogil:
-        return 0
-    def update(self, bint clock):
-        return self._update(clock)
+    cdef void _update(self, bint clock) nogil:
+        pass
 
     cdef uint64_t depth(self, Path *path, int *err) nogil:
         return 0
@@ -109,39 +106,43 @@ cdef class Node:
 
 cdef class Input(Node):
 
-    cdef object gen        # the input generator
-    cdef bint is_splitter
+    cdef double[:] data
+    cdef uint64_t i, size
+    cdef bint loop
 
-    def __init__(self, object gen=None, object fn=None, double value=0.0):
+    def __init__(self, double[:] data=None, object fn=None, double value=0.0, bint loop=0):
         self.pot[0] = value
         self.pot[1] = value
-        self.gen = gen
-        if isinstance(gen, Splitter):
-            self.is_splitter = 1
+        self.loop = loop
+        self.size = data.size
+        self.data = data if self.size > 0 else None
         self.fn = fn
 
-    cdef int _update(self, bint clock) nogil:
-        cdef double pot = 0.0
-        if self.gen is not None:
-            if self.is_splitter:
-                pot = (<Splitter>self.gen).nxt(NULL)
-            else:
-                with gil:
-                    try:
-                        pot = <double>next(self.gen)
-                    except StopIteration:
-                        pot = 0.0
-                        self.gen = None
+    cdef void _update(self, bint clock) nogil:
+        cdef double pot
+        if self.data is not None:
+            pot = self.data[self.i]
+            self.i += 1
+            if self.loop:
+                self.i %= self.size
+            elif self.i >= self.size:
+                self.data = None
+        else:
+            pot = 0.0
         if self.pfn is not None:
             with gil:
                 pot = <double>self.pfn(pot)
         elif self.cfn != NULL:
             pot = self.cfn(pot)
         self.pot[not clock] = pot
-        return 0
 
     def __str__(self):
         return 'Input'
+
+    @classmethod
+    def Layer(self, double[:,:] data=None, object fn=None, double value=0.0, bint loop=0):
+        cols = data.shape[1]
+        return [Input(data=data[i], fn=fn, value=value, loop=loop) for i in range(cols)]
 
 cdef struct Parent:
     PyObject *node
@@ -247,7 +248,7 @@ cdef class Neuron(Node):
                     Py_INCREF(key)
                     self.parents[l].bias = <double>value
 
-    cdef int _update(self, bint clock) nogil:
+    cdef void _update(self, bint clock) nogil:
         cdef double pot = self.bias
         cdef uint64_t i
         for i in range(self.c):
@@ -258,7 +259,6 @@ cdef class Neuron(Node):
         elif self.cfn != NULL:
             pot = self.cfn(pot)
         self.pot[not clock] = pot
-        return 0
 
     cdef uint64_t depth(self, Path *path, int *err) nogil:
         cdef uint64_t i, tmp, r = 0
@@ -507,18 +507,15 @@ cdef class Network:
         return str(self)
 
     @classmethod
-    def Layers(self, object layers, object gen):
-        cdef SH sh = SH(gen)
-        if sh.width == 0:
-            raise ValueError('Generator must not be empty.')
-        cdef uint64_t i
-        cdef list nodes = [Input(gen=Splitter(sh, i)) for i in range(sh.width)]
-        cdef uint64_t w, last_w = sh.width
-        for l in layers:
-            w = <uint64_t>abs(l)
-            if w == 0:
-                raise ValueError('Layer width cannot be zero.')
-            nodes.extend([Neuron(bias=normal(), parents={n: normal(1.0/sqrt(last_w)) for n in nodes[-last_w:]}, fn='sig') for i in range(w)])
+    def Layered(self, object layers, double[:,:] data):
+        nodes = Input.Layer(data=data)
+        last_w = len(nodes)
+        if last_w == 0:
+            raise ValueError('Input data must not be empty.')
+        for w in layers:
+            if w <= 0:
+                raise ValueError('Layer width must be positive.')
+            nodes.extend([Neuron(bias=normal(), parents={n: normal(0.0, 1.0/sqrt(last_w)) for n in nodes[-last_w:]}, fn='sig') for i in range(w)])
             last_w = w
-        return Network(nodes=nodes, output=nodes[-last_w:])
+        return self(nodes=nodes, output=nodes[-last_w:])
 
