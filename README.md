@@ -40,3 +40,4 @@ n = Network.Layered([10, 3], in_v)
 
 n.backprop(expect=out_v, batch=batch_size)
 ```
+

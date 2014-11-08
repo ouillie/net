@@ -4,8 +4,7 @@ from libc.math cimport log, sqrt
 from cython cimport boundscheck
 from cython.parallel cimport prange
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XDECREF
-cimport numpy as np
-
+cimport numpy as np 
 from numpy.random import normal
 from struct import pack, unpack
 
@@ -66,28 +65,31 @@ cdef str re_cfns(nodefn fn):
 cdef class Node:
     """The basic element of a Network."""
 
-    cdef double pot[2]
-    cdef object pfn
-    cdef double (*cfn)(double) nogil
-    cdef bint is_neuron
+    cdef double pot[2]                # Potential values at clock low and high
+    cdef object pfn                   # Custom APF
+    cdef double (*cfn)(double) nogil  # Built-in APF
+    cdef bint is_neuron               # Whether to perform backpropagation
 
     property fn:
-        "If fn is a string, use the associated built-in C function. If fn is callable, use it as a python function."
+        "The action potential function of the node.\n"
+        "Built-in APFs are represented by their name as a string. Custom APFs must be callable Python objects.\n"
+        "Functions must take a single numerical argument and return a numerical result."
         def __get__(self):
-            if self.pfn is not None:
-                return self.pfn
             if self.cfn != NULL:
                 return re_cfns(self.cfn)
-            return None
+            return self.pfn
         def __set__(self, object x):
             if x is None:
                 self.pfn = None
                 self.cfn = NULL
-            elif callable(x):
-                self.pfn = x
             elif isinstance(x, basestring):
                 self.pfn = None
                 self.cfn = cfns(str(x))
+                if self.cfn == NULL:
+                    raise ValueError('APF \'%s\' not a valid built-in function.' % str(x))
+            elif callable(x):
+                self.pfn = x
+                self.cfn = NULL
             else:
                 raise TypeError('Expects fn to be callable or a string.')
         def __del__(self):
@@ -95,13 +97,29 @@ cdef class Node:
             self.cfn = NULL
 
     def __init__(self, double value=0.0, object fn=None):
+        """Create a new Node object.
+
+        Keyword arguments:
+        value -- A constant potential value.
+        fn -- The APF; Node outputs fn(value) if fn is not None else (value).
+        """
         self.pot[0] = value
         self.pot[1] = value
         self.fn = fn
 
-    def __call__(self, bint clock=0):
-        return self.pot[clock]
+    # TODO: Make this better?
+    def __call__(self, clock=None):
+        if clock is None:
+            return (self.pot[0] + self.pot[1]) / 2.0
+        elif isinstance(clock, int):
+            if clock == 0 or clock == 1:
+                return self.pot[clock]
+            else:
+                raise ValueError('clock must be 0 or 1.')
+        else:
+            raise TypeError('clock must be 0 or 1.')
 
+    # For convenience: maps a Node's input to it's output through it's APF.
     cdef void _update_set(self, bint clock, double pot) nogil:
         if self.pfn is not None:
             with gil:
@@ -113,6 +131,7 @@ cdef class Node:
     cdef void _update(self, bint clock) nogil:
         self._update_set(clock, self.pot[clock])
 
+    # The depth of the node from the input layer. By default, Node is considered an input.
     cdef uint64_t depth(self, Path *path, int *err) nogil:
         return 0
 
@@ -123,28 +142,39 @@ cdef class Node:
         return str(self)
 
 cdef class Input(Node):
+    """A Node designed to quickly read data from an input numpy array."""
 
-    cdef double[:] data
-    cdef uint64_t i, size
-    cdef bint loop
+    cdef double[:] data    # The input vector
+    cdef uint64_t i, size  # Current index and max index
+    cdef bint loop         # Whether to loop when i >= size
 
     def __init__(self, double[:] data=None, object fn=None, double value=0.0, bint loop=0):
+        """Create a new Input object for feeding numerical data into a network.
+
+        Keyword arguments:
+        data -- The data vector; data is read sequentially from the vector at each update. Default is None.
+        fn -- The APF; Input outputs fn(data) if fn is not None else (data). Default is None.
+        value -- The initial potential of the node before any data is read. Default is zero.
+        loop -- Whether to read data cyclically and continuously. By default, potential becomes zero when there is no more data.
+        """
         self.pot[0] = value
         self.pot[1] = value
-        self.loop = loop
-        self.size = data.size
-        self.data = data if self.size > 0 else None
         self.fn = fn
+        self.loop = loop
+        if data.size > 0:
+            self.size = data.size
+            self.data = data
 
     @boundscheck(False)
     cdef void _update(self, bint clock) nogil:
         if self.data is not None:
             self._update_set(clock, self.data[self.i])
             self.i += 1
-            if self.loop:
-                self.i %= self.size
-            elif self.i >= self.size:
-                self.data = None
+            if self.i >= self.size:
+                if self.loop:
+                    self.i %= 0
+                else:
+                    self.data = None
         else:
             self._update_set(clock, 0.0)
 
@@ -153,28 +183,45 @@ cdef class Input(Node):
 
     @classmethod
     def Layer(self, double[:,:] data=None, object fn=None, double value=0.0, bint loop=0):
+        """Returns a list of Input objects, each of which reads data from the corresponding column of a data matrix.
+
+        Keyword arguments:
+        data -- The data matrix; data is read sequentially down the rows at each update. Default is None.
+        fn -- The APF for each node; Input outputs fn(data) if fn is not None else (data). Default is None.
+        value -- The initial potential of each node before any data is read. Default is zero.
+        loop -- Whether each node reads data cyclically and continuously. By default, potential becomes zero when there is no more data.
+        """
         cols = data.shape[1]
         return [self(data=data[:,i], fn=fn, value=value, loop=loop) for i in range(cols)]
 
+# Represents a parent (input) to a neuron.
 cdef struct Parent:
-    PyObject *node
-    double bias
+    double weight   # The synaptic weight.
+    PyObject *node  # The parent object.
 
+# Linked list for tracing depth and feed-forwardness.
 cdef struct Path:
-    PyObject *child
+    PyObject *child  # The Node object at this point in the path.
     Path *nxt
 
 cdef class Neuron(Node):
+    """A Node designed to process input from other nodes and perform backpropagation."""
 
-    cdef public double bias  # the node bias
-    cdef Parent *parents     # array of parents
-    cdef uint64_t c          # number of parents
-    cdef double *dCdp        # for backpropagation
-
-    def __cinit__(self, double bias=0.0, dict parents=None, object fn='sig', double value=0.0):
-        self.is_neuron = 1
+    cdef public double bias  # The node bias.
+    cdef Parent *parents     # Array of parents.
+    cdef uint64_t c          # Number of parents.
+    cdef double *dCdp        # For backpropagation.
 
     def __init__(self, double bias=0.0, dict parents=None, object fn='sig', double value=0.0):
+        """Create a new Neuron object for processing data in a network.
+
+        Keyword arguments:
+        bias -- The node bias; Neuron value is (w * x + b) where w is synaptic weight, x is input and b is bias. Default is zero.
+        parents -- Dictionary of the form {parent: weight} where parent is a Node object and weight is the associated synaptic weight. Default is None.
+        fn -- The APF; Neuron outputs fn(value) if fn is not None else (value). Default is the logistic curve.
+        value -- The initial potential of the node before any data is processed. Default is zero.
+        """
+        self.is_neuron = 1
         self.pot[0] = value
         self.pot[1] = value
         self.fn = fn
@@ -188,21 +235,22 @@ cdef class Neuron(Node):
         free(self.parents)
 
     def __len__(self):
-        """ Returns the number of parents. """
+        """Returns the number of parents."""
         return self.c
 
     def __getitem__(self, object x):
-        """ Returns self's bias for x. """
+        """Returns self's weight for x. Unconnected nodes are considered to have zero weight."""
         cdef uint64_t i = self.index(<PyObject*>x)
-        return self.parents[i].bias if i < self.c else 0.0
+        return self.parents[i].weight if i < self.c else 0.0
 
+    # TODO: See if compound assignment covers this behavior already.
     def __setitem__(self, object x, double y):
-        """ Adds y to self's bias for x. """
+        """Adds y to self's weight for x. Unconnected nodes as considered to have zero weight."""
         if not isinstance(x, Node):
             raise TypeError('Parent must be a Node.')
         cdef uint64_t i = self.index(<PyObject*>x)
         if i < self.c:
-            self.parents[i].bias += y
+            self.parents[i].weight += y
         else:
             self.c += 1
             self.parents = <Parent*>realloc(self.parents, self.c * sizeof(Parent))
@@ -211,11 +259,11 @@ cdef class Neuron(Node):
                 raise MemoryError('Not enough memory to reallocate self.parents.')
             self.parents[i].node = <PyObject*>x
             Py_INCREF(x)
-            self.parents[i].bias = y
+            self.parents[i].weight = y
 
 
     def __delitem__(self, object x):
-        """ Disconnects self from x. """
+        """Disconnects self from x."""
         cdef uint64_t i = self.index(<PyObject*>x), j
         if i < self.c:
             Py_DECREF(<object>self.parents[i].node)
@@ -223,13 +271,16 @@ cdef class Neuron(Node):
             for j in range(i, self.c):
                 self.parents[j] = self.parents[j + 1]
             self.parents = <Parent*>realloc(self.parents, self.c * sizeof(Parent))
+            if self.parents == NULL:
+                self.c = 0
+                raise MemoryError('Not enough memory to reallocate parents.')
 
     def __contains__(self, object x):
-        """ Returns True is x is a parent of self. """
+        """Returns True is x is connected to self."""
         return self.index(<PyObject*>x) < self.c
 
+    # For convenience: Returns the index of node in parents else self.c.
     cdef uint64_t index(self, PyObject *node):
-        """ Returns the index of node in parents else self.c. """
         cdef uint64_t i
         for i in range(self.c):
             if self.parents[i].node == node:
@@ -237,7 +288,7 @@ cdef class Neuron(Node):
         return self.c
 
     def connect(self, dict parents=None):
-        """ Connects a mapping of {node: bias} parents to self. """
+        """Connects a mapping of {node: weight} parents to self."""
         cdef uint64_t l, i
         if parents is not None:
             l = <uint64_t>len(parents)
@@ -258,15 +309,16 @@ cdef class Neuron(Node):
                     l -= 1
                     self.parents[l].node = <PyObject*>key
                     Py_INCREF(key)
-                    self.parents[l].bias = <double>value
+                    self.parents[l].weight = <double>value
 
     cdef void _update(self, bint clock) nogil:
         cdef double pot = self.bias
         cdef uint64_t i
         for i in range(self.c):
-            pot += (<Node>self.parents[i].node).pot[clock] * self.parents[i].bias
+            pot += (<Node>self.parents[i].node).pot[clock] * self.parents[i].weight
         self._update_set(clock, pot)
 
+    # Calculates the depth of the neuron from the input layer. Sets err nonzero is a feedback loop is found.
     cdef uint64_t depth(self, Path *path, int *err) nogil:
         cdef uint64_t i, tmp, r = 0
         cdef Path *newp = path
@@ -306,14 +358,14 @@ cdef class Neuron(Node):
         for i in prange(self.c):
             self.dCdp[i + 1] += (<Node>self.parents[i].node).pot[clock] * front
             if (<Node>self.parents[i].node).is_neuron:
-                (<Neuron>self.parents[i].node)._backprop(self.parents[i].bias * front, clock)
+                (<Neuron>self.parents[i].node)._backprop(self.parents[i].weight * front, clock)
 
     cdef void _register_backprop(self, double alpha, double lamb) nogil:
         self.bias -= alpha * self.dCdp[0]
         self.dCdp[0] = 0.0
         cdef uint64_t i
         for i in range(self.c):
-            self.parents[i].bias -= alpha * (self.dCdp[i + 1] + lamb * self.parents[i].bias)
+            self.parents[i].weight -= alpha * (self.dCdp[i + 1] + lamb * self.parents[i].weight)
             self.dCdp[i + 1] = 0.0
 
     cdef void _dealloc_backprop(self) nogil:
@@ -490,15 +542,96 @@ cdef class Network:
 
     def write(self, filename):
         f = open(filename, 'wb')
-        f.write(pack('', self.c)) # TODO: write
+        f.write(pack('!Q', self.c))
+        for i in range(self.c):
+            if isinstance(<object>self._nodes[i], Neuron):
+                f.write((<Neuron>self._nodes[i]).write_data(self.index))
+            elif isinstance(<object>self._nodes[i], Input):
+                f.write((<Input>self._nodes[i]).write_data(self.index))
+            elif isinstance(<object>self._nodes[i], Node):
+                f.write((<Node>self._nodes[i]).write_data(self.index))
         f.close()
+    #Node
+    cdef str write_data(self, ifn=None):
+        fn_name = re_cfns(self.cfn)
+        if fn_name is None:
+            fn_name = ''
+        return pack('!B3sdd', 0, fn_name, self.pot[0], self.pot[1])
+        #INPUT
+    cdef str write_data(self, ifn=None):
+        fn_name = re_cfns(self.cfn)
+        if fn_name is None:
+            fn_name = ''
+        return pack('!B3sddB', 1, fn_name, self.pot[0], self.pot[1], self.loop)
+#neuron
+    cdef str write_data(self, ifn=None):
+        fn_name = re_cfns(self.cfn)
+        if fn_name is None:
+            fn_name = ''
+        r = pack('!B3sdddQ', 2, fn_name, self.pot[0], self.pot[1], self.bias, self.c)
+        cdef uint64_t i
+        for i in range(self.c):
+            r += pack('!Qd', ifn(<object>self.parents[i].node), self.parents[i].weight)
+        return r
+
+    def index(self, object node):
+        """Returns the index of node in _nodes else self.c."""
+        cdef uint64_t i
+        for i in range(self.c):
+            if self._nodes[i] == <PyObject*>node:
+                return i
+        return self.c
 
     @classmethod
     def open(self, filename): # TODO: write
-        nodes = []
-        output = []
-        cdef bint clock = 0
-        return Network(nodes=nodes, output=output, clock=clock)
+        f = open(filename, 'rb')
+        c, = unpack('!Q', f.read(8))
+        for i in range(c):
+            t, = unpack('!B', f.read(1))
+            if t == 2:    # Neuron
+                pass
+            elif t == 1:  # Input
+                pass
+            else:         # Node
+                pass
+        #return Network(nodes=nodes, output=output, clock=clock)
+        return None
+    #Node
+    cdef int read_data(self, data, ifn=None) except -1:
+        fn_name, pot0, pot1 = unpack('!3sdd', data)
+        self.fn = fn_name
+        self.pot[0] = <double>pot0
+        self.pot[1] = <double>pot1
+        #INPUT
+    cdef int read_data(self, data, ifn=None) except -1:
+        fn_name, pot0, pot1, loop = unpack('!3sddB', data)
+        self.fn = fn_name
+        self.pot[0] = <double>pot0
+        self.pot[1] = <double>pot1
+        self.loop = <bint>loop
+#neuron
+    cdef int read_data(self, data, ifn=None) except -1:
+        fn_name, pot0, pot1, bias, c = unpack('!3sdddQ', data[:35])
+        self.fn = fn_name
+        self.pot[0] = <double>pot0
+        self.pot[1] = <double>pot1
+        self.bias = <double>bias
+        self.c = <uint64_t>c
+        self.parents = <Parent*>malloc(self.c * sizeof(Parent))
+        if self.parents == NULL:
+            self.c = 0
+            raise MemoryError('Not enough memory to allocate parents.')
+        cdef uint64_t i
+        for i in range(self.c):
+            try:
+                n, b = unpack('!Qd', data[(35+16*i):(51+16*i)])
+            except:
+                free(self.parents)
+                self.c = 0
+                raise
+            self.parents[i].node.i = <uint64_t>n
+            self.parents[i].weight = <double>b
+        return 0
 
     def __str__(self):
         cdef uint64_t i
