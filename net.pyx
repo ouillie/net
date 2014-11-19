@@ -5,11 +5,13 @@ from cython cimport boundscheck
 from cython.parallel cimport prange
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XDECREF
 cimport numpy as np 
+from pthread cimport *
 from numpy.random import normal
 from struct import pack, unpack
 
 cdef extern from 'stdint.h':
     ctypedef unsigned long long uint64_t
+    ctypedef signed long long int64_t
 
 cdef extern from 'cfns.h':
     ctypedef double (*nodefn)(double) nogil
@@ -24,7 +26,7 @@ cdef uint64_t neg_mod(int a, uint64_t n) nogil:
         a -= n
     return a
 
-# Builtin action potential functions.
+# Built-in action potential functions.
 def sig(double t):
     """Returns the value of the logistic curve evaluated at t."""
     return _sig(t)
@@ -76,64 +78,118 @@ cdef class Node:
     cdef double pot[2]                # Potential values at clock low and high.
     cdef object pfn                   # Custom APF.
     cdef double (*cfn)(double) nogil  # Built-in APF.
-    cdef bint is_neuron               # Whether to perform backpropagation.
-    cdef bint is_input                # Whether to rewind source after training.
+    cdef bint is_neuron               # Whether to perform backpropagation (is subclass of Neuron).
+    cdef bint is_input                # Whether to cap input during training (is subclass of Input).
+    cdef double *pot_list             # Record of past output values.
+    cdef uint64_t pl_n                # Number of past output values.
+    cdef uint64_t pl_i                # Current index of past output values.
+    cdef pthread_rwlock_t lock        # For read/write locking on parallel applications.
 
     property fn:
         "The action potential function of the node.\n"
         "Built-in APFs are represented by their name as a string. Custom APFs must be callable Python objects.\n"
         "Functions must take a single numerical argument and return a numerical result."
         def __get__(self):
+            cdef object r
+            if pthread_rwlock_rdlock(&self.lock) != 0:
+                raise RuntimeError('Couldn\'t get read lock.')
             if self.cfn != NULL:
-                return re_cfns(self.cfn)
-            return self.pfn
-        def __set__(self, object x):
-            if x is None:
-                self.pfn = None
-                self.cfn = NULL
-            elif isinstance(x, basestring):
-                self.pfn = None
-                self.cfn = cfns(str(x))
-                if self.cfn == NULL:
-                    raise ValueError('APF \'%s\' not a valid built-in function.' % str(x))
-            elif callable(x):
-                self.pfn = x
-                self.cfn = NULL
+                r = re_cfns(self.cfn)
             else:
-                raise TypeError('Expects fn to be callable or a string.')
+                r = self.pfn
+            pthread_rwlock_unlock(&self.lock)
+            return r
+        def __set__(self, object x):
+            if pthread_rwlock_wrlock(&self.lock) != 0:
+                raise RuntimeError('Couldn\'t get write lock.')
+            try:
+                if x is None:
+                    self.pfn = None
+                    self.cfn = NULL
+                elif isinstance(x, basestring):
+                    self.pfn = None
+                    self.cfn = cfns(str(x))
+                    if self.cfn == NULL:
+                        raise ValueError('APF \'%s\' not a valid built-in function.' % str(x))
+                elif callable(x):
+                    self.pfn = x
+                    self.cfn = NULL
+                else:
+                    raise TypeError('Expects fn to be callable or a string.')
+            finally:
+                    pthread_rwlock_unlock(&self.lock)
         def __del__(self):
+            if pthread_rwlock_wrlock(&self.lock):
+                raise RuntimeError('Couldn\'t get write lock.')
             self.pfn = None
             self.cfn = NULL
+            pthread_rwlock_unlock(&self.lock)
 
     def __init__(self, double value=0.0, object fn=None):
         """Create a new Node object.
 
         Keyword arguments:
-        value -- A constant potential value.
-        fn -- The APF; Node outputs fn(value) if fn is not None else (value).
+        value : float - A constant potential value. Default is 0.0.
+        fn: str or callable - The APF; Node outputs fn(value) if fn is not None else (value).
+            if fn is a string, the associated built-in function is used. Default is None.
         """
+        if pthread_rwlock_init(&self.lock, NULL) != 0:
+            raise RuntimeError('Can\'t initialize read/write lock.')
         self.pot[0] = value
         self.pot[1] = value
         self.fn = fn
 
-    def __call__(self, clock=None):
-        """Return the current potential value.
+    def __call__(self, int past=0):
+        """Return the potential value at a certain time.
 
         Keyword arguments:
-        clock -- The clock value at which to sample potential. Must be zero or one or None.
-                 If None, return the average of the two.
+        past : int - How many cycles ago to sample the potential. Must be within the limit for this node.
+            Zero is the current potential. Default is zero.
         """
-        if clock is None:
-            return (self.pot[0] + self.pot[1]) / 2.0
-        elif isinstance(clock, int):
-            if clock == 0 or clock == 1:
-                return self.pot[clock]
-            else:
-                raise ValueError('clock must be 0 or 1.')
-        else:
-            raise TypeError('clock must be 0 or 1.')
+        cdef double r
+        if pthread_rwlock_rdlock(&self.lock):
+            raise RuntimeError('Couldn\'t get read lock.')
+        try:
+            if past < 0 or past >= self.pl_n:
+                raise ValueError('past < 0 or past >= self.pl_n.')
+            r = self.pot_list[<unsigned int>past]
+        finally:
+            pthread_rwlock_unlock(&self.lock)
+        return r
 
-    # For convenience: maps a Node's input to it's output through it's APF.
+    cdef int _enable_mem(self, uint64_t n) except -1:
+        if pthread_rwlock_wrlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get write lock.')
+        cdef uint64_t i
+        try:
+            if n != 0:
+                self.pot_list = <double*>realloc(self.pot_list, n * sizeof(double))
+                if self.pot_list == NULL:
+                    self.pl_n = 0
+                    raise MemoryError('Not enough memory to reallocate self.pot_list.')
+                for i in range(self.pl_n, n):
+                    self.pot_list[i] = 0.0
+            else:
+                free(self.pot_list)
+                self.pot_list = NULL
+            self.pl_n = n
+        finally:
+            pthread_rwlock_unlock(&self.lock)
+        return 0
+    def enable_mem(self, int n):
+        if n < 0:
+            raise ValueError('n must be non-negative.')
+        self._enable_mem(<uint64_t>n)
+
+    cdef void _clear_mem(self) nogil:
+        free(self.pot_list)
+        self.pot_list = NULL
+        self.pl_n = 0
+    def clear_mem(self):
+        self._clear_mem()
+
+    # Maps a Node's input to it's output through it's APF.
+    # Expects the caller to have a write lock!
     cdef void _update_set(self, bint clock, double pot) nogil:
         if self.pfn is not None:
             with gil:
@@ -141,9 +197,17 @@ cdef class Node:
         elif self.cfn != NULL:
             pot = self.cfn(pot)
         self.pot[not clock] = pot
+        if self.pot_list != NULL:
+            self.pot_list[self.pl_i] = pot
+            self.pl_i += 1
+            if self.pl_i >= self.pl_n:
+                self.pl_i = 0
 
+    # NOTE: does not throw exceptions.
     cdef void _update(self, bint clock) nogil:
-        self._update_set(clock, self.pot[clock])
+        if pthread_rwlock_wrlock(&self.lock) == 0:
+            self._update_set(clock, self.pot[clock])
+            pthread_rwlock_unlock(&self.lock)
 
     # The depth of the node from the input layer. By default, Node is considered an input.
     cdef uint64_t depth(self, Path *path, int *err) nogil:
@@ -160,63 +224,74 @@ cdef class Input(Node):
 
     cdef double[:] data    # The input vector
     cdef uint64_t i, size  # Current index and max index
+    cdef int64_t _cap      # Update cap at which to set output to zero and stop reading from the source.
     cdef bint loop         # Whether to loop when i >= size
 
-    def __init__(self, double[:] data=None, object fn=None, double value=0.0, bint loop=0):
+    property cap:
+        "Update cap at which to set output to zero and stop reading from the source. A negative cap means no cap."
+        def __get__(self):
+            return int(self._cap)
+        def __set__(self, int x):
+            self._cap = <int64_t>x
+        def __del__(self):
+            self._cap = -1
+
+    def __init__(self, double[:] data=None, object fn=None, double value=0.0, bint loop=False, int cap=-1):
         """Create a new Input object for feeding numerical data into a network.
 
         Keyword arguments:
-        data -- The data vector; data is read sequentially from the vector at each update. Default is None.
-        fn -- The APF; Input outputs fn(data) if fn is not None else (data). Default is None.
-        value -- The initial potential of the node before any data is read. Default is zero.
-        loop -- Whether to read data cyclically and continuously. By default, potential becomes zero when there is no more data.
+        data : double[:] - The data vector; data is read sequentially from the vector at each update. Default is None.
+        fn : str or callable - The APF; Input outputs fn(data) if fn is not None else (data). See Node.
+        value : float - The initial potential of the node before any data is read. Default is zero.
+        loop : bool - Whether to read data cyclically and continuously. Default is False; potential becomes zero when there is no more data.
+        cap : int - The input cap. See the property description. Default is -1 (no cap).
         """
-        self.is_input = 1
+        cdef int pr = pthread_rwlock_init(&self.lock, NULL)
+        if pr != 0:
+            raise RuntimeError('Can\'t initialize read/write lock %d.' % pr)
+        self.is_input = True
         self.pot[0] = value
         self.pot[1] = value
         self.fn = fn
         self.loop = loop
+        self.cap = cap
         if data.size > 0:
             self.size = data.size
             self.data = data
 
+    # NOTE: does not throw exceptions.
     @boundscheck(False)
     cdef void _update(self, bint clock) nogil:
-        if self.data is not None:
-            self._update_set(clock, self.data[self.i])
-            self.i += 1
-            if self.i >= self.size:
-                if self.loop:
+        if pthread_rwlock_wrlock(&self.lock) == 0:
+            if self.data is not None and self._cap != 0:
+                self._update_set(clock, self.data[self.i])
+                self.i += 1
+                if self.i >= self.size:
                     self.i = 0
-                else:
-                    self.data = None
-        else:
-            self._update_set(clock, 0.0)
+                    if not self.loop:
+                        self.data = None
+                if self._cap > 0:
+                    self._cap -= 1
+            else:
+                self._update_set(clock, 0.0)
+            pthread_rwlock_unlock(&self.lock)
 
     def __str__(self):
         return 'Input'
 
-    # For rewinding networks in training.
-    cdef void rewind(self, int n) nogil:
-        if self.loop:
-            self.i = neg_mod(<int>self.i - n, self.size)
-        elif n > <int>self.i:
-            self.i = 0
-        else:
-            self.i = self.i - n
-
     @classmethod
-    def Layer(self, double[:,:] data=None, object fn=None, double value=0.0, bint loop=0):
+    def Layer(self, double[:,:] data=None, object fn=None, double value=0.0, bint loop=False, int cap=-1):
         """Returns a list of Input objects, each of which reads data from the corresponding column of a data matrix.
 
         Keyword arguments:
-        data -- The data matrix; data is read sequentially down the rows at each update. Default is None.
-        fn -- The APF for each node; Input outputs fn(data) if fn is not None else (data). Default is None.
-        value -- The initial potential of each node before any data is read. Default is zero.
-        loop -- Whether each node reads data cyclically and continuously. By default, potential becomes zero when there is no more data.
+        data : double[:] - The data matrix; data is read sequentially down the rows at each update. Default is None.
+        fn : str or callable - The APF for each node; Layer outputs fn(data) if fn is not None else (data). See Node.
+        value : float - The initial potential of each node before any data is read. Default is zero.
+        loop : bool - Whether each node reads data cyclically and continuously. Default is False; potential becomes zero when there is no more data.
+        cap : int - The input cap for each node. See the property description. Default is -1 (no cap).
         """
         cols = data.shape[1]
-        return [self(data=data[:,i], fn=fn, value=value, loop=loop) for i in range(cols)]
+        return [self(data=data[:,i], fn=fn, value=value, loop=loop, cap=cap) for i in range(cols)]
 
 # Represents a parent (input) to a neuron.
 cdef struct Parent:
@@ -237,25 +312,26 @@ cdef class Neuron(Node):
     cdef double *dCdp            # Batch of partial derivatives (for backpropagation).
     cdef uint64_t _depth         # Depth from input layer (for backpropagation).
     cdef uint64_t _output_depth  # Depth from the output layer (for backpropagation).
-    cdef double *xs              # Previous number of input values (for backpropagation). Size proportional to depth from output.
-    cdef uint64_t _odi           # Current index of the input (output depth) buffer (for backpropagation).
 
     def __init__(self, double bias=0.0, dict parents=None, object fn='sig', double value=0.0):
         """Create a new Neuron object for processing data in a network.
 
         Keyword arguments:
-        bias -- The node bias; Neuron value is (w * x + b) where w is synaptic weight, x is input and b is bias. Default is zero.
-        parents -- Dictionary of the form {parent: weight} where parent is a Node object and weight is the associated synaptic weight. Default is None.
-        fn -- The APF; Neuron outputs fn(value) if fn is not None else (value). Default is the logistic curve.
-        value -- The initial potential of the node before any data is processed. Default is zero.
+        bias : float - The node bias; Neuron value is (w * x + b) where w is synaptic weight, x is input and b is bias. Default is zero.
+        parents : dict - Dictionary of the form {parent: weight} where parent is a Node object and weight is the associated synaptic weight. Default is None.
+        fn : str or callable - The APF; see Node. Default is the logistic curve ('sig').
+        value : float - The initial potential of the node before any data is processed. Default is zero.
         """
         self.is_neuron = 1
         self.pot[0] = value
         self.pot[1] = value
         self.fn = fn
         self.bias = bias
+        if pthread_rwlock_init(&self.lock, NULL):
+            raise RuntimeError('Can\'t initialize read/write lock.')
         self.connect(parents)
 
+    # NOTE: doesn't even try to get the lock.
     def __dealloc__(self):
         cdef uint64_t i
         for i in range(self.c):
@@ -264,50 +340,85 @@ cdef class Neuron(Node):
 
     def __len__(self):
         """Returns the number of parents."""
-        return self.c
+        cdef uint64_t r
+        if pthread_rwlock_rdlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get read lock.')
+        try:
+            r = self.c
+        finally:
+            pthread_rwlock_unlock(&self.lock)
+        return int(r)
 
     def __getitem__(self, object x):
-        """Returns self's weight for x. Unconnected nodes are considered to have zero weight."""
-        cdef uint64_t i = self.index(<PyObject*>x)
-        return self._parents[i].weight if i < self.c else 0.0
+        """Returns self's weight for parent x. Unconnected nodes are considered to have zero weight."""
+        cdef uint64_t i
+        cdef double r
+        if pthread_rwlock_rdlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get read lock.')
+        try:
+            i = self.index(<PyObject*>x)
+            r = self._parents[i].weight if i < self.c else 0.0
+        finally:
+            pthread_rwlock_unlock(&self.lock)
+        return float(r)
 
     # TODO: See if compound assignment covers this behavior already.
     def __setitem__(self, object x, double y):
         """Adds y to self's weight for x. Unconnected nodes as considered to have zero weight."""
+        cdef uint64_t i
         if not isinstance(x, Node):
             raise TypeError('Parent must be a Node.')
-        cdef uint64_t i = self.index(<PyObject*>x)
-        if i < self.c:
-            self._parents[i].weight += y
-        else:
-            self.c += 1
-            self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
-            if self._parents == NULL:
-                self.c = 0
-                raise MemoryError('Not enough memory to reallocate self._parents.')
-            self._parents[i].node = <PyObject*>x
-            Py_INCREF(x)
-            self._parents[i].weight = y
+        if pthread_rwlock_wrlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get write lock.')
+        try:
+            i = self.index(<PyObject*>x)
+            if i < self.c:
+                self._parents[i].weight += y
+            else:
+                self.c += 1
+                self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
+                if self._parents == NULL:
+                    self.c = 0
+                    raise MemoryError('Not enough memory to reallocate self._parents.')
+                self._parents[i].node = <PyObject*>x
+                Py_INCREF(x)
+                self._parents[i].weight = y
+        finally:
+            pthread_rwlock_unlock(&self.lock)
 
 
     def __delitem__(self, object x):
         """Disconnects self from x."""
-        cdef uint64_t i = self.index(<PyObject*>x), j
-        if i < self.c:
-            Py_DECREF(<object>self._parents[i].node)
-            self.c -= 1
-            for j in range(i, self.c):
-                self._parents[j] = self._parents[j + 1]
-            self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
-            if self._parents == NULL:
-                self.c = 0
-                raise MemoryError('Not enough memory to reallocate parents.')
+        cdef uint64_t i, j
+        if pthread_rwlock_wrlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get write lock.')
+        try:
+            i = self.index(<PyObject*>x)
+            if i < self.c:
+                Py_DECREF(<object>self._parents[i].node)
+                self.c -= 1
+                for j in range(i, self.c):
+                    self._parents[j] = self._parents[j + 1]
+                self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
+                if self._parents == NULL:
+                    self.c = 0
+                    raise MemoryError('Not enough memory to reallocate parents.')
+        finally:
+            pthread_rwlock_unlock(&self.lock)
 
     def __contains__(self, object x):
         """Returns True is x is connected to self."""
-        return self.index(<PyObject*>x) < self.c
+        cdef bint r
+        if pthread_rwlock_rdlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get read lock.')
+        try:
+            r = 1 if self.index(<PyObject*>x) < self.c else 0
+        finally:
+            pthread_rwlock_unlock(&self.lock)
+        return bool(r)
 
-    # For convenience: Returns the index of node in parents else self.c.
+    # Returns the index of node in parents else self.c.
+    # Expects the caller to have a read/write lock!
     cdef uint64_t index(self, PyObject *node):
         cdef uint64_t i
         for i in range(self.c):
@@ -319,50 +430,59 @@ cdef class Neuron(Node):
         """Returns a dictionary of {node: weight} parents connected to self."""
         cdef dict r = {}
         cdef uint64_t i
-        for i in range(self.c):
-            r[<object>self._parents[i].node] = float(self._parents[i].weight)
+        if pthread_rwlock_rdlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get read lock.')
+        try:
+            for i in range(self.c):
+                r[<object>self._parents[i].node] = float(self._parents[i].weight)
+        finally:
+            pthread_rwlock_unlock(&self.lock)
         return r
 
     def connect(self, dict parents=None):
         """Connects a mapping of {node: weight} parents to self."""
         cdef uint64_t l, i
-        if parents is not None:
-            l = <uint64_t>len(parents)
-            if l > 0:
-                self.c += l
-                self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
-                if self._parents == NULL:
-                    self.c = 0
-                    raise MemoryError('Not enough memory to reallocate parents.')
-                for (key, value) in parents.items():
-                    if not isinstance(key, Node):
-                        l = self.c - l
-                        for i in range(l, self.c):
-                            Py_DECREF(<object>self._parents[i].node)
-                        self.c = l
-                        self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
-                        raise TypeError('All keys of parents must be Nodes.')
-                    l -= 1
-                    self._parents[l].node = <PyObject*>key
-                    Py_INCREF(key)
-                    self._parents[l].weight = <double>value
+        if pthread_rwlock_rdlock(&self.lock) != 0:
+            raise RuntimeError('Couldn\'t get read lock.')
+        try:
+            if parents is not None:
+                l = <uint64_t>len(parents)
+                if l > 0:
+                    self.c += l
+                    self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
+                    if self._parents == NULL:
+                        self.c = 0
+                        raise MemoryError('Not enough memory to reallocate parents.')
+                    for (key, value) in parents.items():
+                        if not isinstance(key, Node):
+                            l = self.c - l
+                            for i in range(l, self.c):
+                                Py_DECREF(<object>self._parents[i].node)
+                            self.c = l
+                            self._parents = <Parent*>realloc(self._parents, self.c * sizeof(Parent))
+                            raise TypeError('All keys of parents must be Nodes.')
+                        l -= 1
+                        self._parents[l].node = <PyObject*>key
+                        Py_INCREF(key)
+                        self._parents[l].weight = <double>value
+        finally:
+            pthread_rwlock_unlock(&self.lock)
 
+    # NOTE: does not raise exceptions!
     cdef void _update(self, bint clock) nogil:
-        cdef double pot = self.bias, p_pot
+        cdef double pot, p_pot
         cdef uint64_t i
-        for i in range(self.c):
-            p_pot = (<Node>self._parents[i].node).pot[clock]
-            if self.xs != NULL:
-                self.xs[i * self._output_depth + self._odi] = p_pot
-                self._odi += 1
-                if self._odi >= self._output_depth:
-                    self._odi = 0
-            pot += p_pot * self._parents[i].weight
-        self._update_set(clock, pot)
+        if pthread_rwlock_wrlock(&self.lock) == 0:
+            pot = self.bias
+            for i in range(self.c):
+                pot += (<Node>self._parents[i].node).pot[clock] * self._parents[i].weight
+            self._update_set(clock, pot)
+            pthread_rwlock_unlock(&self.lock)
 
     # Calculates the depth of the neuron from the input and output layers and checks for feedback loops.
     # Sets err to -1 if a feedback loop is found, -2 if a memory error occurs. Returns zero on error.
-    cdef uint64_t depth(self, Path *path, int *err, bint force=0) nogil:
+    # NOTE: does not raise exceptions!
+    cdef uint64_t depth(self, Path *path, int *err, bint force=False) nogil:
         cdef uint64_t i, tmp, r = 0
         cdef Path *newp = path
         cdef uint64_t output_depth = 1  # Depth from the output.
@@ -372,74 +492,79 @@ cdef class Neuron(Node):
                 return 0
             newp = newp.nxt
             output_depth += 1
-        if output_depth > (<Neuron>self)._output_depth:
-            (<Neuron>self)._output_depth = output_depth
-        if (<Neuron>self)._depth != 0 and not force:
-            return (<Neuron>self)._depth
-        newp = <Path*>malloc(sizeof(Path))
-        if newp == NULL:
-            err[0] = -2
-            return 0
-        newp.child = <PyObject*>self
-        newp.nxt = path
-        for i in range((<Neuron>self).c):
-            tmp = (<Node>(<Neuron>self)._parents[i].node).depth(newp, err)
-            if err[0] != 0:
-                break
-            if tmp > r:
-                r = tmp
-        free(newp)
-        (<Neuron>self)._depth = r + 1
-        return (<Neuron>self)._depth
+        if pthread_rwlock_rdlock(&self.lock) == 0:
+            if output_depth > (<Neuron>self)._output_depth:
+                (<Neuron>self)._output_depth = output_depth
+            if (<Neuron>self)._depth != 0 and not force:
+                r = (<Neuron>self)._depth
+            else:
+                newp = <Path*>malloc(sizeof(Path))
+                if newp == NULL:
+                    err[0] = -2
+                    r = 0
+                else:
+                    newp.child = <PyObject*>self
+                    newp.nxt = path
+                    for i in range((<Neuron>self).c):
+                        tmp = (<Node>(<Neuron>self)._parents[i].node).depth(newp, err)
+                        if err[0] != 0:
+                            break
+                        if tmp > r:
+                            r = tmp
+                    free(newp)
+                    r += 1
+                    (<Neuron>self)._depth = r
+            pthread_rwlock_unlock(&self.lock)
+            return r
 
     # Allocates and initializes the buffers used for backpropagation.
+    # NOTE: doesn't even try to get the lock.
     cdef int _init_backprop(self) except -1:
-        self.dCdp = <double*>realloc(self.dCdp, (self.c + 1) * sizeof(double))
+        cdef uint64_t i, j = self.c + 1
+        self.dCdp = <double*>realloc(self.dCdp, j * sizeof(double))
         if self.dCdp == NULL:
             raise MemoryError('Not enough memory to allocate self.dCdp.')
-        if self._output_depth == 0:
-            free(self.xs)
-            self.xs = NULL
-        else:
-            self.xs = <double*>realloc(self.xs, self.c * self._output_depth * sizeof(double))
-            if self.xs == NULL:
-                free(self.dCdp)
-                self.dCdp = NULL
-                raise MemoryError('Not enough memory to allocate self.xs.')
-        self._odi = 0
-        cdef uint64_t i, j = self.c + 1
+        self._enable_mem(self._output_depth)
         for i in range(j):
             self.dCdp[i] = 0.0
-        j = self.c * self._output_depth
-        for i in range(j):
-            self.xs[i] = 0.0
         return 0
 
     # Performs parrallel recursive backpropagation on a batch. Calls the backpropation function of each of it's parents.
-    cdef void _backprop(self, double front, bint clock, uint64_t output_depth) nogil:
-        front *= self.pot[clock] * (1.0 - self.pot[clock])
-        self.dCdp[0] += front  # dCdb
+    # NOTE: does not throw exceptions.
+    cdef int _backprop(self, double front, uint64_t output_depth) nogil:
         cdef uint64_t i
-        for i in prange(self.c):
-            self.dCdp[i + 1] += self.xs[i * self._output_depth + neg_mod(self._odi - output_depth, self._output_depth)] * front
+        cdef double p_p
+        if pthread_rwlock_rdlock(&self.lock) != 0:
+            return -1
+        p_p = self.pot_list[neg_mod(<int>self.pl_i - <int>output_depth, self.pl_n)] # past value
+        pthread_rwlock_unlock(&self.lock)
+        front *= p_p * (1.0 - p_p)
+        self.dCdp[0] += front  # dCdb
+        #for i in prange(self.c):
+        for i in range(self.c):
+            if pthread_rwlock_rdlock(&(<Node>self._parents[i].node).lock) == 0:
+                self.dCdp[i + 1] += (<Node>self._parents[i].node).pot_list[neg_mod(<int>(<Node>self._parents[i].node).pl_i - <int>output_depth, (<Node>self._parents[i].node).pl_n)] * front
+            pthread_rwlock_unlock(&(<Node>self._parents[i].node).lock)
             if (<Node>self._parents[i].node).is_neuron:
-                (<Neuron>self._parents[i].node)._backprop(self._parents[i].weight * front, clock, output_depth + 1)
+                (<Neuron>self._parents[i].node)._backprop(self._parents[i].weight * front, output_depth + 1)
+        return 0
 
     # Tunes the neuron's parameters by averaging the partial derivatives calculated over a batch.
+    # NOTE: does not throw exceptions.
     cdef void _register_backprop(self, double alpha, double lamb) nogil:
-        self.bias -= alpha * self.dCdp[0]
-        self.dCdp[0] = 0.0
         cdef uint64_t i
-        for i in range(self.c):
-            self._parents[i].weight -= alpha * (self.dCdp[i + 1] + lamb * self._parents[i].weight)
-            self.dCdp[i + 1] = 0.0
+        if pthread_rwlock_rdlock(&self.lock) == 0:
+            self.bias -= alpha * self.dCdp[0]
+            self.dCdp[0] = 0.0
+            for i in range(self.c):
+                self._parents[i].weight -= alpha * (self.dCdp[i + 1] + lamb * self._parents[i].weight)
+                self.dCdp[i + 1] = 0.0
+            pthread_rwlock_unlock(&self.lock)
 
     # Deallocates the buffers used in backpropagation.
     cdef void _dealloc_backprop(self) nogil:
         free(self.dCdp)
-        free(self.xs)
         self.dCdp = NULL
-        self.xs = NULL
 
     def __str__(self):
         return 'Neuron(degree=%d, bias=%f)' % (self.c, self.bias)
@@ -530,7 +655,8 @@ cdef class Network:
     cdef double *_update_once(self, PyObject **output, uint64_t oc) nogil:
         cdef double *r = NULL
         cdef uint64_t i
-        for i in prange(self.c, nogil=True):
+        #for i in prange(self.c, nogil=True):
+        for i in range(self.c):
             (<Node>self._nodes[i])._update(self.clock)
         self.clock = not self.clock
         if output != NULL:
@@ -599,7 +725,7 @@ cdef class Network:
             print('Depth of network = %d' % depth)
         return depth
 
-    cdef int _bp_init(self, bint verbose=False) except -1:
+    cdef int _bp_init(self, uint64_t times, bint verbose=False) except -1:
         if verbose:
             print('Setting up backpropagation buffers ...'),
         cdef uint64_t i, j
@@ -614,27 +740,18 @@ cdef class Network:
                         if (<Node>self._nodes[j]).is_neuron:
                             (<Neuron>self._nodes[j])._dealloc_backprop()
                     raise
+            if (<Node>self._nodes[i]).is_input:
+                (<Input>self._nodes[i])._cap = <int64_t>times
         if verbose:
             print('Done.')
         return 0
 
     cdef void _bp_prerun(self, uint64_t depth, bint verbose=False):
-        cdef uint64_t i
-        if depth > 0:
-            if verbose:
-                print('Pre-running ...'),
-            for i in range(depth):
-                self._update_once(NULL, 0)
-            if verbose:
-                print('Done.')
-
-    cdef void _bp_rewind(self, uint64_t depth, bint verbose=False):
         if verbose:
-            print('Rewinding ...'),
+            print('Pre-running...'),
         cdef uint64_t i
-        for i in range(self.c):
-            if (<Node>self._nodes[i]).is_input:
-                (<Input>self._nodes[i]).rewind(depth)
+        for i in range(depth):
+            self._update_once(NULL, 0)
         if verbose:
             print('Done.')
 
@@ -642,9 +759,12 @@ cdef class Network:
         if verbose:
             print('Freeing backpropagation buffers ...'),
         cdef uint64_t i
-        for i in prange(self.c, nogil=True):
+        #for i in prange(self.c, nogil=True):
+        for i in range(self.c):
             if (<Node>self._nodes[i]).is_neuron:
                 (<Neuron>self._nodes[i])._dealloc_backprop()
+            if (<Node>self._nodes[i]).is_input:
+                (<Input>self._nodes[i])._cap = -1
         if verbose:
             print('Done.')
 
@@ -660,11 +780,11 @@ cdef class Network:
         verbose -- Whether to be verbose. Default is False.
         """
         depth = self._bp_depth(depth, verbose)
-        self._bp_init(verbose)
-        self._bp_prerun(depth, verbose)
         alpha /= <double>batch
         #lamb *= <double>batch
         cdef uint64_t l = expect.size / (self.oc * batch)
+        self._bp_init(l * batch, verbose)
+        self._bp_prerun(depth, verbose)
         if verbose:
             print('Running [%d] {' % l)
         cdef double cost, c
@@ -689,19 +809,19 @@ cdef class Network:
                     c = g - e
                     if (<Node>self._output[k]).is_neuron:
                         with nogil:
-                            (<Neuron>self._output[k])._backprop(c, self.clock, 0)
+                            (<Neuron>self._output[k])._backprop(c, 0)
                     cost += c * c
                 if max_g_i == max_e_i:
                     correct += 1
             if verbose:
                 print('\tBatch [%d] Cost = %f' % (batch, cost / (2.0 * batch)))
-            for k in prange(self.c, nogil=True):
+            #for k in prange(self.c, nogil=True):
+            for k in range(self.c):
                 if (<Node>self._nodes[k]).is_neuron:
                     (<Neuron>self._nodes[k])._register_backprop(alpha, lamb)
         if verbose:
             print('} Done')
-            print('Accuracy = %f%%' % (<double>correct / <double>(batch * l)))
-        self._bp_rewind(depth, verbose)
+            print('Accuracy = %f' % (<double>correct / <double>(batch * l)))
         self._bp_dealloc(verbose)
 
     cdef index(self, object node):
