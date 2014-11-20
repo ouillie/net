@@ -19,12 +19,12 @@ cdef extern from 'cfns.h':
     extern double _bin(double) nogil
 
 # Small function for computing modulus of potentially negative numbers using a for-loop (for consistency across implementations).
-cdef uint64_t neg_mod(int a, uint64_t n) nogil:
+cdef uint64_t neg_mod(int64_t a, uint64_t n):# nogil:
     while a < 0:
-        a += n
-    while a >= n:
-        a -= n
-    return a
+        a += <int64_t>n
+    while a >= <int64_t>n:
+        a -= <int64_t>n
+    return <uint64_t>a
 
 # Built-in action potential functions.
 def sig(double t):
@@ -72,6 +72,27 @@ cdef str re_cfns(nodefn fn):
         return 'bin'
     return None
 
+# Linked list for tracing depth and checking feed-forwardness.
+cdef struct Path:
+    PyObject *child  # The Node object at this point in the path from the output.
+    Path *nxt
+
+# Common function to Node and Neuron output depth calculation / feedback loop detection.
+# Returns -1 if a feedback loop is found, zero otherwise.
+cdef int _calc_output_depth(PyObject *node, Path *path) nogil:
+    cdef Path *tmp = path
+    cdef uint64_t output_depth = 1
+    while tmp != NULL:
+        if tmp.child == node:  # Feedback loop found.
+            return -1
+        tmp = tmp.nxt
+        output_depth += 1
+    if pthread_rwlock_wrlock(&(<Node>node).lock) == 0:
+        if output_depth > (<Node>node)._output_depth:
+            (<Node>node)._output_depth = output_depth
+        pthread_rwlock_unlock(&(<Node>node).lock)
+    return 0
+
 cdef class Node:
     """The basic element of a Network."""
 
@@ -83,6 +104,7 @@ cdef class Node:
     cdef double *pot_list             # Record of past output values.
     cdef uint64_t pl_n                # Number of past output values.
     cdef uint64_t pl_i                # Current index of past output values.
+    cdef uint64_t _output_depth       # Depth from the output layer (for training).
     cdef pthread_rwlock_t lock        # For read/write locking on parallel applications.
 
     property fn:
@@ -157,6 +179,14 @@ cdef class Node:
             pthread_rwlock_unlock(&self.lock)
         return r
 
+    # Returns zero; what is considered to be the input depth by default for Nodes and Inputs (Inputs by definition).
+    # Also calculates and stores the output depth for recording past output values necesarry in training.
+    # Sets err to -1 if a feedback loop is found, -2 if a memory error occurs. Returns zero on error.
+    # NOTE: does not raise exceptions!
+    cdef uint64_t depth(self, Path *path, int *err, bint force=False) nogil:
+        err[0] = _calc_output_depth(<PyObject*>self, path)
+        return 0
+
     cdef int _enable_mem(self, uint64_t n) except -1:
         if pthread_rwlock_wrlock(&self.lock) != 0:
             raise RuntimeError('Couldn\'t get write lock.')
@@ -208,10 +238,6 @@ cdef class Node:
         if pthread_rwlock_wrlock(&self.lock) == 0:
             self._update_set(clock, self.pot[clock])
             pthread_rwlock_unlock(&self.lock)
-
-    # The depth of the node from the input layer. By default, Node is considered an input.
-    cdef uint64_t depth(self, Path *path, int *err) nogil:
-        return 0
 
     def __str__(self):
         return 'Node'
@@ -298,11 +324,6 @@ cdef struct Parent:
     double weight   # The synaptic weight.
     PyObject *node  # The parent object.
 
-# Linked list for tracing depth and feed-forwardness.
-cdef struct Path:
-    PyObject *child  # The Node object at this point in the path.
-    Path *nxt
-
 cdef class Neuron(Node):
     """A Node designed to process input from other nodes and perform backpropagation."""
 
@@ -311,7 +332,6 @@ cdef class Neuron(Node):
     cdef uint64_t c              # Number of parents.
     cdef double *dCdp            # Batch of partial derivatives (for backpropagation).
     cdef uint64_t _depth         # Depth from input layer (for backpropagation).
-    cdef uint64_t _output_depth  # Depth from the output layer (for backpropagation).
 
     def __init__(self, double bias=0.0, dict parents=None, object fn='sig', double value=0.0):
         """Create a new Neuron object for processing data in a network.
@@ -483,39 +503,32 @@ cdef class Neuron(Node):
     # Sets err to -1 if a feedback loop is found, -2 if a memory error occurs. Returns zero on error.
     # NOTE: does not raise exceptions!
     cdef uint64_t depth(self, Path *path, int *err, bint force=False) nogil:
-        cdef uint64_t i, tmp, r = 0
-        cdef Path *newp = path
-        cdef uint64_t output_depth = 1  # Depth from the output.
-        while newp != NULL:
-            if newp.child == <PyObject*>self:
-                err[0] = -1
-                return 0
-            newp = newp.nxt
-            output_depth += 1
-        if pthread_rwlock_rdlock(&self.lock) == 0:
-            if output_depth > (<Neuron>self)._output_depth:
-                (<Neuron>self)._output_depth = output_depth
+        err[0] = _calc_output_depth(<PyObject*>self, path)
+        if err[0] != 0:
+            return 0
+        cdef uint64_t i, cdepth, r = 0
+        cdef Path *tmp
+        if pthread_rwlock_wrlock(&self.lock) == 0:
             if (<Neuron>self)._depth != 0 and not force:
                 r = (<Neuron>self)._depth
             else:
-                newp = <Path*>malloc(sizeof(Path))
-                if newp == NULL:
+                tmp = <Path*>malloc(sizeof(Path))
+                if tmp == NULL:
                     err[0] = -2
-                    r = 0
                 else:
-                    newp.child = <PyObject*>self
-                    newp.nxt = path
+                    tmp.child = <PyObject*>self
+                    tmp.nxt = path
                     for i in range((<Neuron>self).c):
-                        tmp = (<Node>(<Neuron>self)._parents[i].node).depth(newp, err)
+                        cdepth = (<Node>(<Neuron>self)._parents[i].node).depth(tmp, err)
                         if err[0] != 0:
                             break
-                        if tmp > r:
-                            r = tmp
-                    free(newp)
+                        if cdepth > r:
+                            r = cdepth
+                    free(tmp)
                     r += 1
                     (<Neuron>self)._depth = r
             pthread_rwlock_unlock(&self.lock)
-            return r
+        return r
 
     # Allocates and initializes the buffers used for backpropagation.
     # NOTE: doesn't even try to get the lock.
@@ -524,29 +537,30 @@ cdef class Neuron(Node):
         self.dCdp = <double*>realloc(self.dCdp, j * sizeof(double))
         if self.dCdp == NULL:
             raise MemoryError('Not enough memory to allocate self.dCdp.')
-        self._enable_mem(self._output_depth)
         for i in range(j):
             self.dCdp[i] = 0.0
         return 0
 
     # Performs parrallel recursive backpropagation on a batch. Calls the backpropation function of each of it's parents.
     # NOTE: does not throw exceptions.
-    cdef int _backprop(self, double front, uint64_t output_depth) nogil:
+    cdef int _backprop(self, double front, uint64_t output_depth):# nogil:
         cdef uint64_t i
         cdef double p_p
+        cdef PyObject *tmp
         if pthread_rwlock_rdlock(&self.lock) != 0:
             return -1
-        p_p = self.pot_list[neg_mod(<int>self.pl_i - <int>output_depth, self.pl_n)] # past value
+        p_p = self.pot_list[neg_mod(<int64_t>self.pl_i - <int64_t>output_depth, self.pl_n)] # past value
         pthread_rwlock_unlock(&self.lock)
         front *= p_p * (1.0 - p_p)
         self.dCdp[0] += front  # dCdb
         #for i in prange(self.c):
         for i in range(self.c):
-            if pthread_rwlock_rdlock(&(<Node>self._parents[i].node).lock) == 0:
-                self.dCdp[i + 1] += (<Node>self._parents[i].node).pot_list[neg_mod(<int>(<Node>self._parents[i].node).pl_i - <int>output_depth, (<Node>self._parents[i].node).pl_n)] * front
-            pthread_rwlock_unlock(&(<Node>self._parents[i].node).lock)
-            if (<Node>self._parents[i].node).is_neuron:
-                (<Neuron>self._parents[i].node)._backprop(self._parents[i].weight * front, output_depth + 1)
+            tmp = self._parents[i].node
+            if pthread_rwlock_rdlock(&(<Node>tmp).lock) == 0:
+                self.dCdp[i + 1] += (<Node>tmp).pot_list[neg_mod(<int64_t>(<Node>tmp).pl_i - <int64_t>output_depth, (<Node>tmp).pl_n)] * front
+            pthread_rwlock_unlock(&(<Node>tmp).lock)
+            if (<Node>tmp).is_neuron:
+                (<Neuron>tmp)._backprop(self._parents[i].weight * front, output_depth + 1)
         return 0
 
     # Tunes the neuron's parameters by averaging the partial derivatives calculated over a batch.
@@ -742,6 +756,7 @@ cdef class Network:
                     raise
             if (<Node>self._nodes[i]).is_input:
                 (<Input>self._nodes[i])._cap = <int64_t>times
+            (<Node>self._nodes[i])._enable_mem((<Node>self._nodes[i])._output_depth)
         if verbose:
             print('Done.')
         return 0
@@ -808,8 +823,8 @@ cdef class Network:
                         max_e = e
                     c = g - e
                     if (<Node>self._output[k]).is_neuron:
-                        with nogil:
-                            (<Neuron>self._output[k])._backprop(c, 0)
+                        #with nogil:
+                        (<Neuron>self._output[k])._backprop(c, 0)
                     cost += c * c
                 if max_g_i == max_e_i:
                     correct += 1

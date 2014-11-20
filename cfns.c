@@ -261,7 +261,7 @@ static double sig_aux(double t) {
     double i = t * (double)MAX_I / MAX_T;
     unsigned int i0 = (unsigned int)i;
     if (i0 >= MAX_I - 1)
-        return 0.9999;
+        return 0.9999;  /* saturated output */
     double s0 = sig_table[i0];
     return s0 + (sig_table[i0 + 1] - s0) * (i - (double)i0);
 }
