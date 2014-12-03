@@ -10,7 +10,6 @@ python setup.py install
 from the root directory.
 
 #####Dependencies
-This depends on the following packages:
 * python >= 2.7
 * cython >= 0.17
 * numpy >= 1.8.2
