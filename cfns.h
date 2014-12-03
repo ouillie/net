@@ -1,3 +1,4 @@
+/* cfns.h: See cfns.c */
 
 #ifndef _CFNS_H
 #define _CFNS_H

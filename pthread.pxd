@@ -1,3 +1,4 @@
+# pthread.pxd: Cython definitions for libpthread.
 
 cdef extern from 'pthread.h':
     ctypedef int pthread_t                 # Place-holder

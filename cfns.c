@@ -1,10 +1,13 @@
+/* cfns.c: Low-level C functions:      *
+ *         Action potential functions  */
 
 #include "cfns.h"
-#include "string.h"
 
-#define MAX_I 1000  /* exclusive */
-#define MAX_T 9.0   /* exclusive */
+#define MAX_I 1000  /* Maximum index of lookup table, exclusive. */
+#define MAX_T 9.0   /* Maximum input before saturation is assumed, exclusive. */
 
+/* Lookup table for efficiently computing values along the *
+ * logistic curve using linear interpolation.              */
 static double sig_table[] = {
      0.500000000000, 0.502249984813, 0.504499878504, 0.506749589967,
      0.508999028126, 0.511248101947, 0.513496720456, 0.515744792754,
@@ -257,6 +260,8 @@ static double sig_table[] = {
      0.999867394581, 0.999868582519, 0.999869759817, 0.999870926569,
      0.999872082870, 0.999873228814, 0.999874364493, 0.999875489999,
 };
+
+/* Auxiliary function for computing the logistic function with positive t. */
 static double sig_aux(double t) {
     double i = t * (double)MAX_I / MAX_T;
     unsigned int i0 = (unsigned int)i;
@@ -265,10 +270,13 @@ static double sig_aux(double t) {
     double s0 = sig_table[i0];
     return s0 + (sig_table[i0 + 1] - s0) * (i - (double)i0);
 }
+
+/* _sig: logistic function. */
 double _sig(double t) {
     return t >= 0.0 ? sig_aux(t) : 1.0 - sig_aux(-t);
 }
 
+/* _bin: unit step function. */
 double _bin(double t) {
     return t > 0.0 ? 1.0 : 0.0;
 }
