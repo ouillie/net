@@ -1,6 +1,7 @@
 net
 ===
 This is a Python extension module written in C and Cython for implementing artificial neural networks and performing supervised machine learning.
+This is still in the experimental/prototyping stage of development and not at all tested. Feedback is greatly appreciated.
 
 ###Install
 The package source comes with a standard distutils setup script. The basic install command is:
