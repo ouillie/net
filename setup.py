@@ -7,7 +7,7 @@ import numpy as np
 
 net_ext = Extension(
     'net',
-    ['net.pyx', 'cfns.c'],
+    ['net.pyx', 'aux.pyx', 'cfns.c'],
     extra_compile_args=['-fopenmp'],
     extra_link_args=['-fopenmp'],
 )

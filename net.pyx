@@ -1,95 +1,17 @@
 # net.pyx: This monolithic Cython file implements the vast majority of functionality :/
 
 from libc.stdlib cimport malloc, realloc, free
-from libc.math cimport log, sqrt
+from libc.math cimport sqrt
 from cython cimport boundscheck
 from cython.parallel cimport prange
 from cpython.ref cimport PyObject, Py_INCREF, Py_DECREF, Py_XDECREF
 cimport numpy as np 
-#from pthread cimport *
+from pthread cimport *
+from aux cimport *
 from numpy.random import normal
 from struct import pack, unpack
-
-cdef extern from 'stdint.h':
-    ctypedef unsigned long long uint64_t
-    ctypedef signed long long int64_t
-
-cdef extern from 'pthread.h':
-    ctypedef long pthread_t
-    extern struct pthread_attr_t:
-        pass
-    ctypedef long pthread_rwlock_t
-    extern struct pthread_rwlockattr_t:
-        pass
-    extern int pthread_create(pthread_t*, const pthread_attr_t*, void *(*)(void*), void*) nogil
-    extern int pthread_join(pthread_t, void**) nogil
-    extern int pthread_rwlock_rdlock(pthread_rwlock_t*) nogil
-    extern int pthread_rwlock_wrlock(pthread_rwlock_t*) nogil
-    extern int pthread_rwlock_unlock(pthread_rwlock_t*) nogil
-    extern int pthread_rwlock_init(pthread_rwlock_t*, pthread_rwlockattr_t*) nogil
-
-cdef extern from 'cfns.h':
-    ctypedef double (*nodefn)(double) nogil
-    extern double _sig(double) nogil
-    extern double _bin(double) nogil
-
-# Small function for computing modulus of potentially negative numbers using a for-loop (for consistency across implementations).
-cdef uint64_t neg_mod(int64_t a, uint64_t n) nogil:
-    while a < 0:
-        a += <int64_t>n
-    while a >= <int64_t>n:
-        a -= <int64_t>n
-    return <uint64_t>a
-
-# Built-in action potential functions.
-def sig(double t):
-    """Returns the value of the logistic curve evaluated at t."""
-    return float(_sig(t))
-def bin(double t):
-    """Returns 1 if t > 0 else 0."""
-    return float(_bin(t))
-
-# Built-in cost functions.
-#cdef uint64_t vector_check(double[:] a, double[:] e) except? 0:
-#    cdef uint64_t r = <uint64_t>a.size
-#    if r != a.size or
-@boundscheck(False)
-def quad_cost(double[:] a, double[:] e):
-    """Returns the quadratic cost between two vectors."""
-    cdef uint64_t s = <uint64_t>a.shape[0], i
-    if s != <uint64_t>e.shape[0]:
-        raise ValueError('Vectors must have the same dimension.')
-    cdef double r = 0.0, d
-    for i in range(s):
-        d = a[i] - e[i]
-        r += d * d
-    r /= 2.0
-    return float(r)
-@boundscheck(False)
-def cent_cost(double[:] a, double[:] e):
-    """Returns the cross-entropy cost between two vectors."""
-    cdef uint64_t s = <uint64_t>a.shape[0], i
-    if s != <uint64_t>e.shape[0]:
-        raise ValueError('Vectors must have the same dimension.')
-    cdef double r = 0.0
-    for i in range(s):
-        r -= e[i] * log(a[i]) + (1.0 - e[i]) * log(1.0 - a[i])
-    return r
-
-# For looking up built-in action potential functions by name.
-cdef nodefn cfns(str name):
-    if name == 'sig':
-        return &_sig
-    if name == 'bin':
-        return &_bin
-    return NULL
-# For looking up built-in action potential function names by function pointer.
-cdef str re_cfns(nodefn fn):
-    if fn == &_sig:
-        return 'sig'
-    if fn == &_bin:
-        return 'bin'
-    return None
+from StringIO import StringIO
+from zlib import compress, decompress
 
 # Linked list structure for tracing depth and checking feed-forwardness.
 cdef struct Path:
@@ -200,9 +122,16 @@ cdef class Node:
     # Also initializes the buffer for recording past output values necesarry in training.
     # Sets err to -1 if a feedback loop is found, -2 if the lock can't be attained, -3 if a memory error occurs. Returns zero on error.
     # NOTE: does not raise exceptions!
-    cdef uint64_t depth(self, Path *path, int *err, bint force=False) nogil:
+    cdef uint64_t _depth(self, Path *path, int *err, bint force=False) nogil:
         err[0] = _calc_output_depth(<PyObject*>self, path)
         return 0
+    # Wrapper function for calculating depth from within the Python interpreter.
+    def depth(self):
+        cdef int err = 0
+        cdef uint64_t r = self._depth(NULL, &err)
+        if err != 0:
+            raise RuntimeError('Network is not feed-forward')
+        return int(r)
 
     # Returns -2 if the lock can't be attained, -3 if a memory error occurs. Zero on success.
     cdef int _enable_mem(self, uint64_t n) nogil:
@@ -300,7 +229,7 @@ cdef class Input(Node):
         self.fn = fn
         self.loop = loop
         self._cap = cap
-        if data.size > 0:
+        if data is not None and data.size > 0:
             self.size = <uint64_t>data.size
             self.data = data
 
@@ -344,8 +273,17 @@ cdef class Input(Node):
 
 # Represents a parent (input) to a neuron.
 cdef struct Parent:
-    double weight   # The synaptic weight.
     PyObject *node  # The parent object.
+    double weight   # The synaptic weight.
+
+# Returns the index of node in group (size c) or c if node is not in group.
+cdef uint64_t index_in(PyObject *node, PyObject **group, uint64_t c) nogil:
+    cdef uint64_t i = 0
+    while i < c:
+        if group[i] == node:
+            break
+        i += 1
+    return i
 
 cdef class Neuron(Node):
     """A Node designed to process input from other nodes and perform backpropagation."""
@@ -354,7 +292,7 @@ cdef class Neuron(Node):
     cdef Parent *_parents        # Array of parents.
     cdef uint64_t c              # Number of parents.
     cdef double *dCdp            # Batch of partial derivatives (for backpropagation).
-    cdef uint64_t _depth         # Depth from input layer (for backpropagation).
+    cdef uint64_t __depth        # Depth from input layer (for backpropagation).
 
     def __cinit__(self, double bias=0.0, dict parents=None, object fn='sig', double value=0.0):
         self.is_neuron = 1
@@ -467,12 +405,8 @@ cdef class Neuron(Node):
 
     # Returns the index of node in parents else self.c.
     # Expects the caller to have a read/write lock!
-    cdef uint64_t index(self, PyObject *node):
-        cdef uint64_t i
-        for i in range(self.c):
-            if self._parents[i].node == node:
-                return i
-        return self.c
+    cdef uint64_t index(self, PyObject *node) nogil:
+        return index_in(node, <PyObject**>self._parents, self.c)
 
     def parents(self):
         """Returns a dictionary of {node: weight} parents connected to self."""
@@ -530,7 +464,7 @@ cdef class Neuron(Node):
     # Calculates the depth of the neuron from the input and output layers and checks for feedback loops.
     # Sets err to -1 if a feedback loop is found, -2 if the lock can't be attained, -3 if a memory error occurs. Returns zero on error.
     # NOTE: does not raise exceptions!
-    cdef uint64_t depth(self, Path *path, int *err, bint force=False) nogil:
+    cdef uint64_t _depth(self, Path *path, int *err, bint force=False) nogil:
         cdef uint64_t i, cdepth, r = 0
         cdef Path *tmp
         err[0] = _calc_output_depth(<PyObject*>self, path)
@@ -538,8 +472,8 @@ cdef class Neuron(Node):
             if pthread_rwlock_wrlock(&self.lock) != 0:
                 err[0] = -2
             else:
-                if (<Neuron>self)._depth != 0 and not force:
-                    r = (<Neuron>self)._depth
+                if (<Neuron>self).__depth != 0 and not force:
+                    r = (<Neuron>self).__depth
                 else:
                     tmp = <Path*>malloc(sizeof(Path))
                     if tmp == NULL:
@@ -548,7 +482,7 @@ cdef class Neuron(Node):
                         tmp.child = <PyObject*>self
                         tmp.nxt = path
                         for i in range((<Neuron>self).c):
-                            cdepth = (<Node>(<Neuron>self)._parents[i].node).depth(tmp, err, force)
+                            cdepth = (<Node>(<Neuron>self)._parents[i].node)._depth(tmp, err, force)
                             if err[0] != 0:
                                 break
                             if cdepth > r:
@@ -556,7 +490,7 @@ cdef class Neuron(Node):
                         free(tmp)
                         if err[0] == 0:
                             r += 1
-                            (<Neuron>self)._depth = r
+                            (<Neuron>self).__depth = r
                         else:
                             r = 0
                 pthread_rwlock_unlock(&self.lock)
@@ -771,7 +705,7 @@ cdef class Network:
         cdef uint64_t depth = 0, i, tmp
         cdef int err = 0
         for i in range(self.oc):
-            tmp = (<Node>self._output[i]).depth(NULL, &err)
+            tmp = (<Node>self._output[i])._depth(NULL, &err)
             if err == -1:
                 raise ValueError('Network is not feed-forward.')
             if err == -2:
@@ -904,31 +838,19 @@ cdef class Network:
         free(args)
         self._bp_dealloc(verbose)
 
-    cdef uint64_t index(self, PyObject *node):
+    cdef uint64_t index(self, PyObject *node) nogil:
         """Returns the index of node in _nodes else self.c."""
-        cdef uint64_t i
-        for i in range(self.c):
-            if self._nodes[i] == node:
-                return i
-        return self.c
+        return index_in(node, self._nodes, self.c)
 
-    cdef uint64_t oindex(self, PyObject *node):
-        """Returns the index of node in _output else self.oc."""
-        cdef uint64_t i
-        for i in range(self.oc):
-            if self._output[i] == node:
-                return i
-        return self.oc
-
-    def write(self, filename): # TODO: write
+    def write(self, filename):
         """Encodes, compresses, and saves the network structure to file."""
-        f = open(filename, 'wb')
+        f = StringIO()
         f.write(pack('!QQ', self.c, self.oc))
         for i in range(self.c):
             if (<Node>self._nodes[i]).is_neuron:
                 rents = (<Neuron>self._nodes[i]).parents().items()
                 l = len(rents)
-                f.write(pack('!BdQ', 2, (<Neuron>self._nodes[i]).bias, l))
+                f.write(pack('!BdQ', 2, float((<Neuron>self._nodes[i]).bias), l))
                 for i in range(l):
                     n, w = rents[i]
                     f.write(pack('!Qd', self.index(<PyObject*>n), float(w)))
@@ -936,42 +858,39 @@ cdef class Network:
                 f.write(pack('!B', 1))
             else:
                 f.write(pack('!B', 0))
-            f.write(pack('!Q', self.oindex(self._nodes[i])))
+        for i in range(self.oc):
+            f.write(pack('!Q', self.index(self._output[i])))
+        with open(filename, 'wb') as g:
+            g.write(compress(f.getvalue()))
         f.close()
 
     @classmethod
-    def open(self, filename, double[:,:] data, bint loop=0, int64_t cap=-1): # TODO: write
+    def open(self, filename, double[:,:] data=None, bint loop=0, int64_t cap=-1):
         """Reads, decompresses, and decodes a network structure from a file."""
-        f = open(filename, 'rb')
+        with open(filename, 'rb') as g:
+            f = StringIO(decompress(g.read()))
         c, oc = unpack('!QQ', f.read(16))
-        nodes = []
-        rents = []
-        output = [None] * oc
+        nodes, rents = [], []
         cdef uint64_t input_i = 0
         for i in range(c):
             t, = unpack('!B', f.read(1))
             if t == 2:    # Neuron
                 b, n = unpack('!dQ', f.read(16))
-                r = []
-                for j in range(n):
-                    p, w = unpack('!Qd', f.read(16))
-                    r.append((p, w))
                 nodes.append(Neuron(bias=b, fn='sig'))
-                rents.append(r)
+                rents.append([unpack('!Qd', f.read(16)) for j in range(n)])
             elif t == 1:  # Input
-                nodes.append(Input(data=data[:,input_i], loop=loop, cap=cap))
+                nodes.append(Input(data=(None if data is None else data[:,input_i]), loop=loop, cap=cap))
                 input_i += 1
                 rents.append(None)
             else:         # Node
                 nodes.append(Node())
                 rents.append(None)
-            oind, = unpack('!Q', f.read(8))
-            if oind < oc:
-                output[oind] = nodes[-1]
-        for i in range(c):
-            if rents[i] is not None:
-                nodes[i].connect({nodes[ind]: w for ind, w in rents[i]})
-        return Network(nodes=nodes, output=[o for o in output if o is not None])
+        output = [nodes[i] for i in unpack('!{}Q'.format(oc), f.read(8 * oc))]
+        f.close()
+        for n, r in zip(nodes, rents):
+            if r is not None:
+                n.connect({nodes[ind]: w for ind, w in r})
+        return self(nodes=nodes, output=output)
 
     def __str__(self):
         cdef uint64_t i
